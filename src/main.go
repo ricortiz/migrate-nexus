@@ -106,7 +106,9 @@ func main() {
             defer wg.Done()
             for item := range itemChan {
                 if err := processArtifact(item); err != nil {
-                    log.Printf("[ERROR] %v\n", err)
+                    // processArtifact may return an error if at least one asset fails
+                    // but we continue so other items don't get blocked
+                    log.Printf("[ERROR in processArtifact] %v\n", err)
                 }
             }
         }()
@@ -260,18 +262,32 @@ func queryArtifactsByGroup(group string) ([]NexusSearchItem, error) {
 }
 
 // ----------------------------------------------------------------------
-// processArtifact: checks if item already exists on target, downloads
-// if missing, then uploads to target repo.
+// processArtifact: loops over *all* item.Assets. Each asset is checked
+// for existence, downloaded (if missing), and uploaded (if needed).
+// If at least one asset fails, we return an error (but continue for others).
 // ----------------------------------------------------------------------
 func processArtifact(item NexusSearchItem) error {
     if len(item.Assets) == 0 {
         return fmt.Errorf("no assets for item %s:%s", item.Group, item.Name)
     }
-    asset := item.Assets[0]
 
+    var lastErr error
+    for _, asset := range item.Assets {
+        err := processSingleAsset(item, asset)
+        if err != nil {
+            // We log the error but keep going for other assets
+            log.Printf("[ERROR in processSingleAsset] %v\n", err)
+            lastErr = err
+        }
+    }
+    return lastErr
+}
+
+// processSingleAsset handles a single asset within an item.
+func processSingleAsset(item NexusSearchItem, asset NexusAsset) error {
     exists, err := artifactExistsOnTarget(item)
     if err != nil {
-        return fmt.Errorf("checking existence on target: %w", err)
+        return fmt.Errorf("checking existence on target (asset %s): %w", asset.Path, err)
     }
     if exists {
         log.Printf("[SKIP] Already exists on target: %s:%s (%s)",
@@ -281,13 +297,11 @@ func processArtifact(item NexusSearchItem) error {
 
     artifactData, err := downloadAsset(asset.DownloadURL)
     if err != nil {
-        return fmt.Errorf("downloading asset: %s:%s => %w",
-            item.Group, item.Name, err)
+        return fmt.Errorf("downloading asset %s:%s => %w", item.Group, item.Name, err)
     }
 
     if err := uploadToTarget(asset, artifactData); err != nil {
-        return fmt.Errorf("uploading to target: %s:%s => %w",
-            item.Group, item.Name, err)
+        return fmt.Errorf("uploading to target %s:%s => %w", item.Group, item.Name, err)
     }
 
     log.Printf("[OK] Transferred: %s:%s (%s)",
@@ -297,10 +311,13 @@ func processArtifact(item NexusSearchItem) error {
 
 // ----------------------------------------------------------------------
 // artifactExistsOnTarget: checks if there's already a group/name match
-// on the target. (This version does not check version, but you could
-// extend it to do so by adding &version=%s.)
+// for the given asset on the target. By default, we only query
+// group & name, but you could refine this to check version or path.
 // ----------------------------------------------------------------------
 func artifactExistsOnTarget(item NexusSearchItem) (bool, error) {
+    // If you prefer to check by version:
+    //   &version=%s
+    // Or if you have checksums, you might do a different approach.
     tgtSearchURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s&name=%s",
         strings.TrimRight(*targetURL, "/"),
         url.QueryEscape(*targetRepo),
