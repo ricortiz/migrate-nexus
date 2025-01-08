@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,6 +14,10 @@ import (
 	"sync"
 	"time"
 )
+
+// ----------------------------------------------------------------------
+// Data Structures
+// ----------------------------------------------------------------------
 
 type NexusSearchItem struct {
     Group    string       `json:"group"`
@@ -65,11 +68,15 @@ var (
 
     concurrency = flag.Int("concurrency", getEnvAsInt("CONCURRENCY", 8), "Number of concurrent workers for transfer")
 
+    // You can tweak the Timeout if you're handling extremely large files
     client = &http.Client{
         Timeout: 120 * time.Second, // shared HTTP client with global timeout
     }
 )
 
+// ----------------------------------------------------------------------
+// Main
+// ----------------------------------------------------------------------
 func main() {
     flag.Parse()
 
@@ -83,8 +90,7 @@ func main() {
     log.Printf("Target: %s (repo: %s)\n", *targetURL, *targetRepo)
 
     // ----------------------------------------------------------------------
-    // 1. Get the effective groups for this repo, either manually specified
-    //    or discovered automatically
+    // 1. Get the effective groups for this repo
     // ----------------------------------------------------------------------
     log.Println("Retrieving groups for this repository...")
     groups, err := getGroupsForRepo(*sourceURL, *sourceRepo, *sourceUser, *sourcePass)
@@ -137,8 +143,8 @@ func main() {
 
 // ----------------------------------------------------------------------
 // getGroupsForRepo checks if there is a manually specified list of groups
-// for the given repo. If yes, it returns that list. If not, it calls
-// listAllGroupsFromSource to auto-discover them.
+// for the given repo. If yes, it returns that list. If not, we auto-discover
+// them via listAllGroupsFromSource.
 // ----------------------------------------------------------------------
 func getGroupsForRepo(baseURL, repo, user, pass string) ([]string, error) {
     if groups, ok := manualRepoGroups[repo]; ok {
@@ -166,7 +172,7 @@ func listAllGroupsFromSource(baseURL, repo, user, pass string) ([]string, error)
             url.PathEscape(repo),
         )
         if continuation != "" {
-            reqURL = fmt.Sprintf("%s&continuationToken=%s", reqURL, url.QueryEscape(continuation))
+            reqURL += "&continuationToken=" + url.QueryEscape(continuation)
         }
 
         req, err := http.NewRequest("GET", reqURL, nil)
@@ -263,8 +269,7 @@ func queryArtifactsByGroup(group string) ([]NexusSearchItem, error) {
 
 // ----------------------------------------------------------------------
 // processArtifact: loops over *all* item.Assets. Each asset is checked
-// for existence, downloaded (if missing), and uploaded (if needed).
-// If at least one asset fails, we return an error (but continue for others).
+// for existence, then (if missing) is transferred with a streaming approach.
 // ----------------------------------------------------------------------
 func processArtifact(item NexusSearchItem) error {
     if len(item.Assets) == 0 {
@@ -283,9 +288,12 @@ func processArtifact(item NexusSearchItem) error {
     return lastErr
 }
 
-// processSingleAsset handles a single asset within an item.
+// ----------------------------------------------------------------------
+// processSingleAsset: checks existence on target, then streams the file
+// from source to target if missing.
+// ----------------------------------------------------------------------
 func processSingleAsset(item NexusSearchItem, asset NexusAsset) error {
-    exists, err := artifactExistsOnTarget(item)
+    exists, err := artifactExistsOnTarget(item, asset)
     if err != nil {
         return fmt.Errorf("checking existence on target (asset %s): %w", asset.Path, err)
     }
@@ -295,27 +303,21 @@ func processSingleAsset(item NexusSearchItem, asset NexusAsset) error {
         return nil
     }
 
-    artifactData, err := downloadAsset(asset.DownloadURL)
-    if err != nil {
-        return fmt.Errorf("downloading asset %s:%s => %w", item.Group, item.Name, err)
+    // Stream from source to target using io.Pipe()
+    if err := transferAssetViaPipe(asset); err != nil {
+        return fmt.Errorf("streaming asset %s:%s => %w", item.Group, item.Name, err)
     }
 
-    if err := uploadToTarget(asset, artifactData); err != nil {
-        return fmt.Errorf("uploading to target %s:%s => %w", item.Group, item.Name, err)
-    }
-
-    log.Printf("[OK] Transferred: %s:%s (%s)",
-        item.Group, item.Name, asset.Path)
+    log.Printf("[OK] Transferred: %s:%s (%s)", item.Group, item.Name, asset.Path)
     return nil
 }
 
 // ----------------------------------------------------------------------
-// artifactExistsOnTarget: checks if there's already a group/name match
-// for the given asset on the target. By default, we only query
-// group & name, but you could refine this to check version or path.
+// artifactExistsOnTarget: checks if there's already an identical asset
+// on the target by group/name/version + matching path. If you prefer
+// a checksum comparison, adapt accordingly.
 // ----------------------------------------------------------------------
 func artifactExistsOnTarget(item NexusSearchItem, asset NexusAsset) (bool, error) {
-    // Example adds version too (optional). If you don’t have version, remove it.
     tgtSearchURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s&name=%s&version=%s",
         strings.TrimRight(*targetURL, "/"),
         url.QueryEscape(*targetRepo),
@@ -347,7 +349,7 @@ func artifactExistsOnTarget(item NexusSearchItem, asset NexusAsset) (bool, error
         return false, err
     }
 
-    // Now we loop over the returned items and assets
+    // Compare path within returned items
     for _, foundItem := range sr.Items {
         for _, foundAsset := range foundItem.Assets {
             if foundAsset.Path == asset.Path {
@@ -356,66 +358,77 @@ func artifactExistsOnTarget(item NexusSearchItem, asset NexusAsset) (bool, error
             }
         }
     }
-
     return false, nil
 }
 
-
 // ----------------------------------------------------------------------
-// downloadAsset: simple GET to fetch the artifact from source
+// transferAssetViaPipe: Streams data from the source (asset.DownloadURL)
+// to the target (PUT /repository/<repo>/<asset.Path>) via io.Pipe().
+// This avoids reading the entire file into memory.
 // ----------------------------------------------------------------------
-func downloadAsset(downloadURL string) ([]byte, error) {
-    req, err := http.NewRequest("GET", downloadURL, nil)
+func transferAssetViaPipe(asset NexusAsset) error {
+    // 1) Build a GET request for the source
+    srcReq, err := http.NewRequest("GET", asset.DownloadURL, nil)
     if err != nil {
-        return nil, err
+        return fmt.Errorf("creating GET request for source: %v", err)
     }
-
+    // Basic Auth for source if needed
     if *sourceUser != "" && *sourcePass != "" {
-        req.SetBasicAuth(*sourceUser, *sourcePass)
+        srcReq.SetBasicAuth(*sourceUser, *sourcePass)
     }
 
-    resp, err := client.Do(req)
+    // 2) Perform the GET to the source
+    srcResp, err := client.Do(srcReq)
     if err != nil {
-        return nil, err
+        return fmt.Errorf("GET source error: %v", err)
     }
-    defer resp.Body.Close()
-
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("downloadAsset: unexpected status code %d", resp.StatusCode)
+    if srcResp.StatusCode != http.StatusOK {
+        srcResp.Body.Close()
+        return fmt.Errorf("source returned status %d for %s", srcResp.StatusCode, asset.DownloadURL)
     }
 
-    return io.ReadAll(resp.Body)
-}
+    // 3) Create an io.Pipe()
+    r, w := io.Pipe()
 
-// ----------------------------------------------------------------------
-// uploadToTarget: PUT the artifact bytes to the target (raw-style).
-// ----------------------------------------------------------------------
-func uploadToTarget(asset NexusAsset, data []byte) error {
+    // In a separate goroutine, copy from sourceResp.Body => pipe's writer
+    go func() {
+        defer w.Close()
+        _, copyErr := io.Copy(w, srcResp.Body)
+        srcResp.Body.Close()
+        if copyErr != nil {
+            // If copying fails, propagate error to the reader side
+            w.CloseWithError(copyErr)
+        }
+    }()
+
+    // 4) Prepare a PUT request to the target
     putURL := fmt.Sprintf("%s/repository/%s/%s",
         strings.TrimRight(*targetURL, "/"),
         url.PathEscape(*targetRepo),
         url.PathEscape(asset.Path),
     )
 
-    req, err := http.NewRequest("PUT", putURL, bytes.NewReader(data))
+    putReq, err := http.NewRequest("PUT", putURL, r)
     if err != nil {
-        return err
+        return fmt.Errorf("creating PUT request: %v", err)
     }
-
+    // Basic Auth for target if needed
     if *targetUser != "" && *targetPass != "" {
-        req.SetBasicAuth(*targetUser, *targetPass)
+        putReq.SetBasicAuth(*targetUser, *targetPass)
     }
+    putReq.Header.Set("Content-Type", "application/octet-stream")
 
-    req.Header.Set("Content-Type", "application/octet-stream")
-
-    resp, err := client.Do(req)
+    // 5) Execute the PUT, reading from the pipe
+    putResp, err := client.Do(putReq)
     if err != nil {
-        return err
+        return fmt.Errorf("PUT target error: %v", err)
     }
-    defer resp.Body.Close()
+    defer putResp.Body.Close()
 
-    if resp.StatusCode < 200 || resp.StatusCode > 299 {
-        return fmt.Errorf("uploadToTarget: unexpected status code %d", resp.StatusCode)
+    if putResp.StatusCode < 200 || putResp.StatusCode > 299 {
+        bodyBytes, _ := io.ReadAll(putResp.Body)
+        return fmt.Errorf("upload to target failed, code %d: %s",
+            putResp.StatusCode, string(bodyBytes))
     }
 
     return nil
