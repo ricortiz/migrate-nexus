@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -156,10 +156,9 @@ func getGroupsForRepo(baseURL, repo, user, pass string) ([]string, error) {
 // ----------------------------------------------------------------------
 func listAllGroupsFromSource(baseURL, repo, user, pass string) ([]string, error) {
     var allGroups []string
-
     continuation := ""
+
     for {
-        // Build the request URL
         reqURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s",
             strings.TrimRight(baseURL, "/"),
             url.PathEscape(repo),
@@ -192,14 +191,13 @@ func listAllGroupsFromSource(baseURL, repo, user, pass string) ([]string, error)
         }
         resp.Body.Close()
 
-        // Collect groups from current page items
+        // Collect groups from this page
         for _, item := range sr.Items {
             if !contains(allGroups, item.Group) {
                 allGroups = append(allGroups, item.Group)
             }
         }
 
-        // Check if there's a continuation token
         if sr.ContinuationToken == "" {
             break // no more pages
         }
@@ -210,40 +208,55 @@ func listAllGroupsFromSource(baseURL, repo, user, pass string) ([]string, error)
 }
 
 // ----------------------------------------------------------------------
-// queryArtifactsByGroup: returns all items under a specific group in
-// the source repo. (Still uses the /service/rest/v1/search endpoint.)
+// queryArtifactsByGroup: now loop until continuationToken is empty, so
+// that you don't miss any items if a single group has more than one page.
 // ----------------------------------------------------------------------
 func queryArtifactsByGroup(group string) ([]NexusSearchItem, error) {
-    srcSearchURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s",
-        strings.TrimRight(*sourceURL, "/"),
-        url.QueryEscape(*sourceRepo),
-        url.QueryEscape(group),
-    )
+    var allItems []NexusSearchItem
+    continuation := ""
 
-    req, err := http.NewRequest("GET", srcSearchURL, nil)
-    if err != nil {
-        return nil, err
-    }
-    if *sourceUser != "" && *sourcePass != "" {
-        req.SetBasicAuth(*sourceUser, *sourcePass)
+    for {
+        srcSearchURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s",
+            strings.TrimRight(*sourceURL, "/"),
+            url.QueryEscape(*sourceRepo),
+            url.QueryEscape(group),
+        )
+        if continuation != "" {
+            srcSearchURL += "&continuationToken=" + url.QueryEscape(continuation)
+        }
+
+        req, err := http.NewRequest("GET", srcSearchURL, nil)
+        if err != nil {
+            return nil, err
+        }
+        if *sourceUser != "" && *sourcePass != "" {
+            req.SetBasicAuth(*sourceUser, *sourcePass)
+        }
+
+        resp, err := client.Do(req)
+        if err != nil {
+            return nil, err
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode != http.StatusOK {
+            return nil, fmt.Errorf("queryArtifactsByGroup: unexpected status code %d", resp.StatusCode)
+        }
+
+        var sr NexusSearchResponse
+        if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+            return nil, err
+        }
+
+        allItems = append(allItems, sr.Items...)
+
+        if sr.ContinuationToken == "" {
+            break
+        }
+        continuation = sr.ContinuationToken
     }
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close()
-
-    if resp.StatusCode != http.StatusOK {
-        return nil, fmt.Errorf("queryArtifactsByGroup: unexpected status code %d", resp.StatusCode)
-    }
-
-    var sr NexusSearchResponse
-    if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-        return nil, err
-    }
-
-    return sr.Items, nil
+    return allItems, nil
 }
 
 // ----------------------------------------------------------------------
@@ -344,7 +357,7 @@ func downloadAsset(downloadURL string) ([]byte, error) {
         return nil, fmt.Errorf("downloadAsset: unexpected status code %d", resp.StatusCode)
     }
 
-    return ioutil.ReadAll(resp.Body)
+    return io.ReadAll(resp.Body)
 }
 
 // ----------------------------------------------------------------------
