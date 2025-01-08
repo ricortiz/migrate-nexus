@@ -314,15 +314,14 @@ func processSingleAsset(item NexusSearchItem, asset NexusAsset) error {
 // for the given asset on the target. By default, we only query
 // group & name, but you could refine this to check version or path.
 // ----------------------------------------------------------------------
-func artifactExistsOnTarget(item NexusSearchItem) (bool, error) {
-    // If you prefer to check by version:
-    //   &version=%s
-    // Or if you have checksums, you might do a different approach.
-    tgtSearchURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s&name=%s",
+func artifactExistsOnTarget(item NexusSearchItem, asset NexusAsset) (bool, error) {
+    // Example adds version too (optional). If you don’t have version, remove it.
+    tgtSearchURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s&name=%s&version=%s",
         strings.TrimRight(*targetURL, "/"),
         url.QueryEscape(*targetRepo),
         url.QueryEscape(item.Group),
         url.QueryEscape(item.Name),
+        url.QueryEscape(item.Version),
     )
 
     req, err := http.NewRequest("GET", tgtSearchURL, nil)
@@ -348,8 +347,19 @@ func artifactExistsOnTarget(item NexusSearchItem) (bool, error) {
         return false, err
     }
 
-    return len(sr.Items) > 0, nil
+    // Now we loop over the returned items and assets
+    for _, foundItem := range sr.Items {
+        for _, foundAsset := range foundItem.Assets {
+            if foundAsset.Path == asset.Path {
+                // Found exact path match => definitely exists
+                return true, nil
+            }
+        }
+    }
+
+    return false, nil
 }
+
 
 // ----------------------------------------------------------------------
 // downloadAsset: simple GET to fetch the artifact from source
