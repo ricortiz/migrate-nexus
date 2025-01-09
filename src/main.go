@@ -270,14 +270,33 @@ func createOrEnsureRepo(sourceBaseURL, sourceRepo, targetBaseURL, targetRepo, bl
 		return fmt.Errorf("failed to fetch repository definition: %w", err)
 	}
 
+	// Check the repository type
+	repoType, ok := srcDef["type"].(string)
+	if !ok {
+		return fmt.Errorf("unable to determine repository type for '%s'", sourceRepo)
+	}
+
+	// Adjust repository name and blob store
 	srcDef["name"] = targetRepo
 	if storage, ok := srcDef["storage"].(map[string]interface{}); ok {
 		storage["blobStoreName"] = blobStoreName
 	}
 
+	// Create the repository on the target
 	log.Printf("Ensuring repository '%s' exists on target...\n", targetRepo)
-	return createRepoOnTarget(targetBaseURL, srcDef, targetUser, targetPass)
+	if err := createRepoOnTarget(targetBaseURL, srcDef, targetUser, targetPass); err != nil {
+		return fmt.Errorf("failed to create repository on target: %w", err)
+	}
+
+	// Gracefully exit if the repository type is 'group' or 'proxy'
+	if repoType == "group" || repoType == "proxy" {
+		log.Printf("Source repository '%s' is of type '%s'. Exiting gracefully after creating the target repository and blob store.\n", sourceRepo, repoType)
+		os.Exit(0)
+	}
+
+	return nil
 }
+
 
 func getRepositoryDefinition(baseURL, repoName, user, pass string) (map[string]interface{}, error) {
 	endpoint := fmt.Sprintf("%s/service/rest/v1/repositories/%s", strings.TrimRight(baseURL, "/"), url.PathEscape(repoName))
