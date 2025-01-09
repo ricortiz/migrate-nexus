@@ -32,7 +32,7 @@ type NexusAsset struct {
     Format      string            `json:"format"`
     Path        string            `json:"path"`
     DownloadURL string            `json:"downloadUrl"`
-    Checksum    map[string]string `json:"checksum"`
+    Checksum    map[string]string `json:"checksum"` // e.g. {"sha1":"abc123...", "sha256":"def..."}
 }
 
 type NexusSearchResponse struct {
@@ -70,7 +70,7 @@ var (
 
     // You can tweak the Timeout if you're handling extremely large files
     client = &http.Client{
-        Timeout: 120 * time.Second, // shared HTTP client with global timeout
+        Timeout: 30 * time.Minute, // shared HTTP client with global timeout
     }
 )
 
@@ -79,6 +79,17 @@ var (
 // ----------------------------------------------------------------------
 func main() {
     flag.Parse()
+
+    // If target flags are not provided, default to source flags
+    if *targetUser == "" {
+        *targetUser = *sourceUser
+    }
+    if *targetPass == "" {
+        *targetPass = *sourcePass
+    }
+    if *targetRepo == "" {
+        *targetRepo = *sourceRepo
+    }
 
     // Validate required flags
     if *sourceURL == "" || *sourceRepo == "" || *targetURL == "" || *targetRepo == "" {
@@ -313,50 +324,152 @@ func processSingleAsset(item NexusSearchItem, asset NexusAsset) error {
 }
 
 // ----------------------------------------------------------------------
-// artifactExistsOnTarget: checks if there's already an identical asset
-// on the target by group/name/version + matching path. If you prefer
-// a checksum comparison, adapt accordingly.
+// artifactExistsOnTarget:
+// 1) If we have a recognized checksum in the source asset (sha256, sha1, md5),
+//    do a direct search by hash on the target. If found => exists
+// 2) Otherwise (or if not found), fallback to group/name/version + path check
 // ----------------------------------------------------------------------
 func artifactExistsOnTarget(item NexusSearchItem, asset NexusAsset) (bool, error) {
-    tgtSearchURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s&name=%s&version=%s",
-        strings.TrimRight(*targetURL, "/"),
-        url.QueryEscape(*targetRepo),
-        url.QueryEscape(item.Group),
-        url.QueryEscape(item.Name),
-        url.QueryEscape(item.Version),
-    )
-
-    req, err := http.NewRequest("GET", tgtSearchURL, nil)
-    if err != nil {
-        return false, err
-    }
-    if *targetUser != "" && *targetPass != "" {
-        req.SetBasicAuth(*targetUser, *targetPass)
+    hashType, hashValue := pickPreferredHash(asset)
+    if hashType != "" && hashValue != "" {
+        // Attempt direct search by hash
+        found, err := searchByHashOnTarget(hashType, hashValue)
+        if err != nil {
+            return false, fmt.Errorf("searchByHashOnTarget(%s) failed: %w", hashType, err)
+        }
+        if found {
+            return true, nil
+        }
     }
 
-    resp, err := client.Do(req)
-    if err != nil {
-        return false, err
-    }
-    defer resp.Body.Close()
+    // Fallback if no recognized hash or not found by hash
+    return fallbackPathCheck(item, asset)
+}
 
-    if resp.StatusCode != http.StatusOK {
-        return false, fmt.Errorf("artifactExistsOnTarget: unexpected status code %d", resp.StatusCode)
+// ----------------------------------------------------------------------
+// pickPreferredHash: tries sha256, then sha1, then md5
+// ----------------------------------------------------------------------
+func pickPreferredHash(asset NexusAsset) (string, string) {
+    if val, ok := asset.Checksum["sha256"]; ok && val != "" {
+        return "sha256", val
     }
-
-    var sr NexusSearchResponse
-    if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-        return false, err
+    if val, ok := asset.Checksum["sha1"]; ok && val != "" {
+        return "sha1", val
     }
+    if val, ok := asset.Checksum["md5"]; ok && val != "" {
+        return "md5", val
+    }
+    return "", ""
+}
 
-    // Compare path within returned items
-    for _, foundItem := range sr.Items {
-        for _, foundAsset := range foundItem.Assets {
-            if foundAsset.Path == asset.Path {
-                // Found exact path match => definitely exists
-                return true, nil
+// ----------------------------------------------------------------------
+// searchByHashOnTarget: pages through /service/rest/v1/search?sha1=xxx (or sha256=..., md5=...)
+// If any item is found, we conclude the artifact exists
+// ----------------------------------------------------------------------
+func searchByHashOnTarget(hashType, hashValue string) (bool, error) {
+    cont := ""
+    for {
+        // e.g.:  /service/rest/v1/search?repository=myrepo&sha256=abc123
+        queryKey := url.QueryEscape(hashType) // "sha256", "sha1", or "md5"
+        queryURL := fmt.Sprintf(
+            "%s/service/rest/v1/search?repository=%s&%s=%s",
+            strings.TrimRight(*targetURL, "/"),
+            url.QueryEscape(*targetRepo),
+            queryKey,
+            url.QueryEscape(hashValue),
+        )
+        if cont != "" {
+            queryURL += "&continuationToken=" + url.QueryEscape(cont)
+        }
+
+        req, err := http.NewRequest("GET", queryURL, nil)
+        if err != nil {
+            return false, err
+        }
+        if *targetUser != "" && *targetPass != "" {
+            req.SetBasicAuth(*targetUser, *targetPass)
+        }
+
+        resp, err := client.Do(req)
+        if err != nil {
+            return false, err
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode != http.StatusOK {
+            return false, fmt.Errorf("searchByHashOnTarget: code %d", resp.StatusCode)
+        }
+
+        var sr NexusSearchResponse
+        if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+            return false, err
+        }
+
+        if len(sr.Items) > 0 {
+            // Found at least one item => artifact with this hash exists
+            return true, nil
+        }
+        if sr.ContinuationToken == "" {
+            break
+        }
+        cont = sr.ContinuationToken
+    }
+    return false, nil
+}
+
+// ----------------------------------------------------------------------
+// fallbackPathCheck: group/name/version search, then compare asset.Path
+// ----------------------------------------------------------------------
+func fallbackPathCheck(item NexusSearchItem, asset NexusAsset) (bool, error) {
+    cont := ""
+    for {
+        queryURL := fmt.Sprintf("%s/service/rest/v1/search?repository=%s&group=%s&name=%s&version=%s",
+            strings.TrimRight(*targetURL, "/"),
+            url.QueryEscape(*targetRepo),
+            url.QueryEscape(item.Group),
+            url.QueryEscape(item.Name),
+            url.QueryEscape(item.Version),
+        )
+        if cont != "" {
+            queryURL += "&continuationToken=" + url.QueryEscape(cont)
+        }
+
+        req, err := http.NewRequest("GET", queryURL, nil)
+        if err != nil {
+            return false, err
+        }
+        if *targetUser != "" && *targetPass != "" {
+            req.SetBasicAuth(*targetUser, *targetPass)
+        }
+
+        resp, err := client.Do(req)
+        if err != nil {
+            return false, err
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode != http.StatusOK {
+            return false, fmt.Errorf("fallbackPathCheck: code %d", resp.StatusCode)
+        }
+
+        var sr NexusSearchResponse
+        if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+            return false, err
+        }
+
+        // Compare path
+        for _, fItem := range sr.Items {
+            for _, fAsset := range fItem.Assets {
+                if fAsset.Path == asset.Path {
+                    return true, nil
+                }
             }
         }
+
+        if sr.ContinuationToken == "" {
+            break
+        }
+        cont = sr.ContinuationToken
     }
     return false, nil
 }
@@ -390,7 +503,7 @@ func transferAssetViaPipe(asset NexusAsset) error {
     // 3) Create an io.Pipe()
     r, w := io.Pipe()
 
-    // In a separate goroutine, copy from sourceResp.Body => pipe's writer
+    // In a separate goroutine, copy from srcResp.Body => pipe's writer
     go func() {
         defer w.Close()
         _, copyErr := io.Copy(w, srcResp.Body)
