@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -38,6 +39,11 @@ type NexusAsset struct {
 type NexusSearchResponse struct {
     Items             []NexusSearchItem `json:"items"`
     ContinuationToken string            `json:"continuationToken"`
+}
+
+type BlobStore struct {
+	Name string `json:"name"`
+	Type string `json:"type"`
 }
 
 // ----------------------------------------------------------------------
@@ -100,7 +106,20 @@ func main() {
     log.Printf("Source: %s (repo: %s)\n", *sourceURL, *sourceRepo)
     log.Printf("Target: %s (repo: %s)\n", *targetURL, *targetRepo)
 
+	// 0. Ensure the required blob store exists
     // ----------------------------------------------------------------------
+	blobStoreName := getBlobStoreNameByRepoType(*targetRepo)
+	log.Printf("Ensuring blob store '%s' exists...\n", blobStoreName)
+	if err := createOrEnsureBlobStore(*targetURL, blobStoreName, *targetUser, *targetPass); err != nil {
+		log.Fatalf("Failed to ensure blob store: %v", err)
+	}
+
+	// Ensure the repository exists on the target
+	log.Printf("Ensuring target repository '%s' exists...\n", *targetRepo)
+	if err := createOrEnsureRepo(*sourceURL, *sourceRepo, *targetURL, *targetRepo, blobStoreName, *sourceUser, *sourcePass, *targetUser, *targetPass); err != nil {
+		log.Fatalf("Failed to ensure target repository: %v", err)
+	}
+
     // 1. Get the effective groups for this repo
     // ----------------------------------------------------------------------
     log.Println("Retrieving groups for this repository...")
@@ -150,6 +169,200 @@ func main() {
     wg.Wait()
 
     log.Println("Transfer complete.")
+}
+
+// ----------------------------------------------------------------------
+// createOrEnsureBlobStore: Ensures the required blob store exists on the target
+// ----------------------------------------------------------------------
+func createOrEnsureBlobStore(baseURL, blobStoreName, user, pass string) error {
+	// Check if the blob store already exists
+	blobStores, err := listBlobStores(baseURL, user, pass)
+	if err != nil {
+		return fmt.Errorf("failed to list blob stores: %w", err)
+	}
+
+	for _, blobStore := range blobStores {
+		if blobStore.Name == blobStoreName {
+			log.Printf("Blob store '%s' already exists.\n", blobStoreName)
+			return nil
+		}
+	}
+
+	// Create the blob store if it does not exist
+	log.Printf("Creating blob store '%s'...\n", blobStoreName)
+	return createBlobStore(baseURL, blobStoreName, user, pass)
+}
+
+func listBlobStores(baseURL, user, pass string) ([]BlobStore, error) {
+	endpoint := fmt.Sprintf("%s/service/rest/v1/blobstores", strings.TrimRight(baseURL, "/"))
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to list blob stores: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var blobStores []BlobStore
+	if err := json.NewDecoder(resp.Body).Decode(&blobStores); err != nil {
+		return nil, fmt.Errorf("decoding blob stores JSON: %w", err)
+	}
+
+	return blobStores, nil
+}
+
+func createBlobStore(baseURL, blobStoreName, user, pass string) error {
+	endpoint := fmt.Sprintf("%s/service/rest/v1/blobstores/file", strings.TrimRight(baseURL, "/"))
+
+	payload := map[string]interface{}{
+		"name": blobStoreName,
+		"path": blobStoreName,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal blob store payload: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payloadBytes))
+	if err != nil {
+		return fmt.Errorf("creating POST request failed: %w", err)
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST blob store creation error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create blob store: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Blob store '%s' successfully created.\n", blobStoreName)
+	return nil
+}
+
+// ----------------------------------------------------------------------
+// createOrEnsureRepo: Ensures the target repository exists by fetching the
+// source repository configuration, cleaning it, and creating it on the target
+// ----------------------------------------------------------------------
+func createOrEnsureRepo(sourceBaseURL, sourceRepo, targetBaseURL, targetRepo, blobStoreName, sourceUser, sourcePass, targetUser, targetPass string) error {
+	log.Printf("Fetching repository configuration for '%s' from source...\n", sourceRepo)
+	srcDef, err := getRepositoryDefinition(sourceBaseURL, sourceRepo, sourceUser, sourcePass)
+	if err != nil {
+		return fmt.Errorf("failed to fetch repository definition: %w", err)
+	}
+
+	srcDef["name"] = targetRepo
+	if storage, ok := srcDef["storage"].(map[string]interface{}); ok {
+		storage["blobStoreName"] = blobStoreName
+	}
+
+	log.Printf("Ensuring repository '%s' exists on target...\n", targetRepo)
+	return createRepoOnTarget(targetBaseURL, srcDef, targetUser, targetPass)
+}
+
+func getRepositoryDefinition(baseURL, repoName, user, pass string) (map[string]interface{}, error) {
+	endpoint := fmt.Sprintf("%s/service/rest/v1/repositories/%s", strings.TrimRight(baseURL, "/"), url.PathEscape(repoName))
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating GET request failed: %w", err)
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET repository definition error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("failed to fetch repository definition: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	var def map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&def); err != nil {
+		return nil, fmt.Errorf("decoding repository definition JSON: %w", err)
+	}
+
+	return def, nil
+}
+
+func createRepoOnTarget(baseURL string, repoDef map[string]interface{}, user, pass string) error {
+	cleanRepoDefinition(repoDef)
+
+	endpoint := fmt.Sprintf("%s/service/rest/v1/repositories", strings.TrimRight(baseURL, "/"))
+	payload, err := json.Marshal(repoDef)
+	if err != nil {
+		return fmt.Errorf("failed to marshal repository definition: %w", err)
+	}
+
+	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+	if err != nil {
+		return fmt.Errorf("creating POST request failed: %w", err)
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("POST repository creation error: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to create repository: status %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Repository '%s' successfully created on target.\n", repoDef["name"])
+	return nil
+}
+
+// ----------------------------------------------------------------------
+// getBlobStoreNameByRepoType: Determines the blob store name based on repo type
+// ----------------------------------------------------------------------
+func getBlobStoreNameByRepoType(repoName string) string {
+	switch repoName {
+	case "maven2":
+		return "maven"
+	default:
+		return repoName
+	}
+}
+
+// ----------------------------------------------------------------------
+// cleanRepoDefinition: Cleans up repository definition for POST
+// ----------------------------------------------------------------------
+func cleanRepoDefinition(def map[string]interface{}) {
+	delete(def, "_links")
+	delete(def, "url")
+	delete(def, "format")
+	delete(def, "type")
+	delete(def, "contentPermissions")
 }
 
 // ----------------------------------------------------------------------
@@ -458,9 +671,12 @@ func fallbackPathCheck(item NexusSearchItem, asset NexusAsset) (bool, error) {
         }
 
         // Compare path
+        // Normalize paths
+        normalizedAssetPath := strings.TrimPrefix(asset.Path, "/")
         for _, fItem := range sr.Items {
             for _, fAsset := range fItem.Assets {
-                if fAsset.Path == asset.Path {
+                normalizedFAssetPath := strings.TrimPrefix(fAsset.Path, "/")
+                if normalizedFAssetPath == normalizedAssetPath {
                     return true, nil
                 }
             }
