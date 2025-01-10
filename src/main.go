@@ -29,12 +29,13 @@ type NexusSearchItem struct {
 }
 
 type NexusAsset struct {
-    ID          string            `json:"id"`
-    Repository  string            `json:"repository"`
-    Format      string            `json:"format"`
-    Path        string            `json:"path"`
-    DownloadURL string            `json:"downloadUrl"`
-    Checksum    map[string]string `json:"checksum"` // e.g. {"sha1":"abc123...", "sha256":"def..."}
+	ID          string            `json:"id"`
+	Repository  string            `json:"repository"`
+	Format      string            `json:"format"`
+	Path        string            `json:"path"`
+	DownloadURL string            `json:"downloadUrl"`
+	Checksum    map[string]string `json:"checksum"`
+	Size        int64             `json:"fileSize"` // Map directly from the JSON `fileSize` field
 }
 
 type NexusSearchResponse struct {
@@ -637,34 +638,6 @@ func processArtifact(item NexusSearchItem) error {
 }
 
 // ----------------------------------------------------------------------
-// processSingleAsset: checks existence on target, then streams the file
-// from source to target if missing.
-// ----------------------------------------------------------------------
-func processSingleAsset(item NexusSearchItem, asset NexusAsset) error {
-    exists, err := artifactExistsOnTarget(item, asset)
-    if err != nil {
-        return fmt.Errorf("checking existence on target (asset %s): %w", asset.Path, err)
-    }
-    if exists {
-        log.Printf("[SKIP] Already exists on target: %s:%s (%s)",
-            item.Group, item.Name, asset.Path)
-        return nil
-    }
-
-    // Stream from source to target using io.Pipe()
-    if err := transferAssetViaPipe(asset); err != nil {
-        return fmt.Errorf("streaming asset %s:%s => %w", item.Group, item.Name, err)
-    }
-
-	// Update stats
-	atomic.AddInt64(&stats.TotalFilesTransferred, 1)
-	atomic.AddInt64(&stats.TotalBytesTransferred, int64(len(asset.Path))) // Approximation for demo purposes
-
-    log.Printf("[OK] Transferred: %s:%s (%s)", item.Group, item.Name, asset.Path)
-    return nil
-}
-
-// ----------------------------------------------------------------------
 // artifactExistsOnTarget:
 // 1) If we have a recognized checksum in the source asset (sha256, sha1, md5),
 //    do a direct search by hash on the target. If found => exists
@@ -819,6 +792,33 @@ func fallbackPathCheck(item NexusSearchItem, asset NexusAsset) (bool, error) {
 }
 
 // ----------------------------------------------------------------------
+// processSingleAsset: checks existence on target, then streams the file
+// from source to target if missing.
+// ----------------------------------------------------------------------
+func processSingleAsset(item NexusSearchItem, asset NexusAsset) error {
+    exists, err := artifactExistsOnTarget(item, asset)
+    if err != nil {
+        return fmt.Errorf("checking existence on target (asset %s): %w", asset.Path, err)
+    }
+    if exists {
+        log.Printf("[SKIP] Already exists on target: %s:%s (%s)",
+            item.Group, item.Name, asset.Path)
+        return nil
+    }
+
+    // Stream from source to target using io.Pipe()
+    if err := transferAssetViaPipe(asset); err != nil {
+        return fmt.Errorf("streaming asset %s:%s => %w", item.Group, item.Name, err)
+    }
+
+	// Update stats
+	atomic.AddInt64(&stats.TotalFilesTransferred, 1)
+
+    log.Printf("[OK] Transferred: %s:%s (%s)", item.Group, item.Name, asset.Path)
+    return nil
+}
+
+// ----------------------------------------------------------------------
 // transferAssetViaPipe: Streams data from the source (asset.DownloadURL)
 // to the target (PUT /repository/<repo>/<asset.Path>) via io.Pipe().
 // This avoids reading the entire file into memory.
@@ -843,6 +843,12 @@ func transferAssetViaPipe(asset NexusAsset) error {
         srcResp.Body.Close()
         return fmt.Errorf("source returned status %d for %s", srcResp.StatusCode, asset.DownloadURL)
     }
+
+	// Use fileSize from the JSON metadata, falling back to Content-Length if necessary
+	contentLength := asset.Size
+	if contentLength == 0 {
+		contentLength = srcResp.ContentLength
+	}
 
     // 3) Create an io.Pipe()
     r, w := io.Pipe()
@@ -887,6 +893,11 @@ func transferAssetViaPipe(asset NexusAsset) error {
         return fmt.Errorf("upload to target failed, code %d: %s",
             putResp.StatusCode, string(bodyBytes))
     }
+
+	// Update total bytes transferred
+	if contentLength > 0 {
+		atomic.AddInt64(&stats.TotalBytesTransferred, contentLength)
+	}
 
     return nil
 }
