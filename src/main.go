@@ -106,17 +106,10 @@ func main() {
     log.Printf("Source: %s (repo: %s)\n", *sourceURL, *sourceRepo)
     log.Printf("Target: %s (repo: %s)\n", *targetURL, *targetRepo)
 
-	// 0. Ensure the required blob store exists
+	// 0. Ensure the required blob store and repository exists
     // ----------------------------------------------------------------------
-	blobStoreName := getBlobStoreNameByRepoType(*targetRepo)
-	log.Printf("Ensuring blob store '%s' exists...\n", blobStoreName)
-	if err := createOrEnsureBlobStore(*targetURL, blobStoreName, *targetUser, *targetPass); err != nil {
-		log.Fatalf("Failed to ensure blob store: %v", err)
-	}
-
-	// Ensure the repository exists on the target
-	log.Printf("Ensuring target repository '%s' exists...\n", *targetRepo)
-	if err := createOrEnsureRepo(*sourceURL, *sourceRepo, *targetURL, *targetRepo, blobStoreName, *sourceUser, *sourcePass, *targetUser, *targetPass); err != nil {
+	log.Printf("Ensuring target repository (and corresponding blob store) '%s' exists...\n", *targetRepo)
+	if err := createOrEnsureRepo(*sourceURL, *sourceRepo, *targetURL, *targetRepo, *sourceUser, *sourcePass, *targetUser, *targetPass); err != nil {
 		log.Fatalf("Failed to ensure target repository: %v", err)
 	}
 
@@ -263,17 +256,26 @@ func createBlobStore(baseURL, blobStoreName, user, pass string) error {
 // createOrEnsureRepo: Ensures the target repository exists by fetching the
 // source repository configuration, cleaning it, and creating it on the target
 // ----------------------------------------------------------------------
-func createOrEnsureRepo(sourceBaseURL, sourceRepo, targetBaseURL, targetRepo, blobStoreName, sourceUser, sourcePass, targetUser, targetPass string) error {
+func createOrEnsureRepo(sourceBaseURL, sourceRepo, targetBaseURL, targetRepo, sourceUser, sourcePass, targetUser, targetPass string) error {
 	log.Printf("Fetching repository configuration for '%s' from source...\n", sourceRepo)
 	srcDef, err := getRepositoryDefinition(sourceBaseURL, sourceRepo, sourceUser, sourcePass)
 	if err != nil {
 		return fmt.Errorf("failed to fetch repository definition: %w", err)
 	}
 
-	// Check the repository type
+	// Determine the repository type
 	repoType, ok := srcDef["type"].(string)
 	if !ok {
 		return fmt.Errorf("unable to determine repository type for '%s'", sourceRepo)
+	}
+
+	// Determine the blob store name based on the repository type
+	blobStoreName := getBlobStoreNameByRepoType(repoType)
+
+	// Ensure the blob store exists
+	log.Printf("Ensuring blob store '%s' exists...\n", blobStoreName)
+	if err := createOrEnsureBlobStore(targetBaseURL, blobStoreName, targetUser, targetPass); err != nil {
+		return fmt.Errorf("failed to ensure blob store: %w", err)
 	}
 
 	// Adjust repository name and blob store
@@ -296,7 +298,6 @@ func createOrEnsureRepo(sourceBaseURL, sourceRepo, targetBaseURL, targetRepo, bl
 
 	return nil
 }
-
 
 func getRepositoryDefinition(baseURL, repoName, user, pass string) (map[string]interface{}, error) {
 	endpoint := fmt.Sprintf("%s/service/rest/v1/repositories/%s", strings.TrimRight(baseURL, "/"), url.PathEscape(repoName))
@@ -364,12 +365,12 @@ func createRepoOnTarget(baseURL string, repoDef map[string]interface{}, user, pa
 // ----------------------------------------------------------------------
 // getBlobStoreNameByRepoType: Determines the blob store name based on repo type
 // ----------------------------------------------------------------------
-func getBlobStoreNameByRepoType(repoName string) string {
-	switch repoName {
+func getBlobStoreNameByRepoType(repoType string) string {
+	switch repoType {
 	case "maven2":
 		return "maven"
 	default:
-		return repoName
+		return repoType
 	}
 }
 
