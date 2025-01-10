@@ -300,19 +300,46 @@ func createOrEnsureRepo(sourceBaseURL, sourceRepo, targetBaseURL, targetRepo, so
 }
 
 func getRepositoryDefinition(baseURL, repoName, user, pass string) (map[string]interface{}, error) {
-	endpoint := fmt.Sprintf("%s/service/rest/v1/repositories/%s", strings.TrimRight(baseURL, "/"), url.PathEscape(repoName))
+	// Try the newer API first: repositories/<repo-name>
+	newerEndpoint := fmt.Sprintf("%s/service/rest/v1/repositories/%s", strings.TrimRight(baseURL, "/"), url.PathEscape(repoName))
 
-	req, err := http.NewRequest("GET", endpoint, nil)
+	req, err := http.NewRequest("GET", newerEndpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating GET request failed: %w", err)
+		return nil, fmt.Errorf("creating GET request for newer API failed: %w", err)
 	}
 	if user != "" && pass != "" {
 		req.SetBasicAuth(user, pass)
 	}
 
 	resp, err := client.Do(req)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		defer resp.Body.Close()
+		var def map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&def); err != nil {
+			return nil, fmt.Errorf("decoding repository definition from newer API failed: %w", err)
+		}
+		return def, nil
+	}
+
+	if resp != nil {
+		resp.Body.Close()
+		log.Printf("Newer API endpoint not available or failed (status: %d). Falling back to older API...\n", resp.StatusCode)
+	}
+
+	// Fallback to older API: v1/repositorySettings
+	olderEndpoint := fmt.Sprintf("%s/service/rest/v1/repositorySettings", strings.TrimRight(baseURL, "/"))
+
+	req, err = http.NewRequest("GET", olderEndpoint, nil)
 	if err != nil {
-		return nil, fmt.Errorf("GET repository definition error: %w", err)
+		return nil, fmt.Errorf("creating GET request for older API failed: %w", err)
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("GET repository definition from older API failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -321,12 +348,20 @@ func getRepositoryDefinition(baseURL, repoName, user, pass string) (map[string]i
 		return nil, fmt.Errorf("failed to fetch repository definition: status %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	var def map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&def); err != nil {
-		return nil, fmt.Errorf("decoding repository definition JSON: %w", err)
+	// Decode the repository settings JSON
+	var allSettings []map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&allSettings); err != nil {
+		return nil, fmt.Errorf("decoding repository settings JSON failed: %w", err)
 	}
 
-	return def, nil
+	// Find the specific repository settings for the given repo name
+	for _, repo := range allSettings {
+		if repo["name"] == repoName {
+			return repo, nil
+		}
+	}
+
+	return nil, fmt.Errorf("repository '%s' not found in repository settings", repoName)
 }
 
 func createRepoOnTarget(baseURL string, repoDef map[string]interface{}, user, pass string) error {
