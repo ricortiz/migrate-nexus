@@ -365,26 +365,71 @@ func getRepositoryDefinition(baseURL, repoName, user, pass string) (map[string]i
 }
 
 func createRepoOnTarget(baseURL string, repoDef map[string]interface{}, user, pass string) error {
-	cleanRepoDefinition(repoDef)
+	// Extract necessary fields from the repo definition
+	repoName, ok := repoDef["name"].(string)
+	if !ok || repoName == "" {
+		return fmt.Errorf("repository definition is missing 'name'")
+	}
 
-	endpoint := fmt.Sprintf("%s/service/rest/v1/repositories", strings.TrimRight(baseURL, "/"))
+	repoFormat, ok := repoDef["format"].(string)
+	if !ok || repoFormat == "" {
+		return fmt.Errorf("repository definition is missing 'format'")
+	}
+
+	repoType, ok := repoDef["type"].(string)
+	if !ok || repoType == "" {
+		return fmt.Errorf("repository definition is missing 'type'")
+	}
+
+	// Check if the repository already exists
+	checkEndpoint := fmt.Sprintf("%s/service/rest/v1/repositories/%s/%s/%s",
+		strings.TrimRight(baseURL, "/"), url.PathEscape(repoFormat), url.PathEscape(repoType), url.PathEscape(repoName))
+
+	req, err := http.NewRequest("GET", checkEndpoint, nil)
+	if err != nil {
+		return fmt.Errorf("creating GET request to check repository existence failed: %w", err)
+	}
+	if user != "" && pass != "" {
+		req.SetBasicAuth(user, pass)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("checking repository existence failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusOK {
+		log.Printf("Repository '%s' already exists on target.\n", repoName)
+		return nil
+	} else if resp.StatusCode != http.StatusNotFound {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("unexpected status code when checking repository: %d, body: %s", resp.StatusCode, string(body))
+	}
+
+	// Repository doesn't exist, proceed to create it
+	log.Printf("Repository '%s' not found on target. Creating it...\n", repoName)
+
+	cleanRepoDefinition(repoDef)
+	createEndpoint := fmt.Sprintf("%s/service/rest/v1/repositories", strings.TrimRight(baseURL, "/"))
+
 	payload, err := json.Marshal(repoDef)
 	if err != nil {
 		return fmt.Errorf("failed to marshal repository definition: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(payload))
+	req, err = http.NewRequest("POST", createEndpoint, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("creating POST request failed: %w", err)
+		return fmt.Errorf("creating POST request for repository creation failed: %w", err)
 	}
 	if user != "" && pass != "" {
 		req.SetBasicAuth(user, pass)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
+	resp, err = client.Do(req)
 	if err != nil {
-		return fmt.Errorf("POST repository creation error: %w", err)
+		return fmt.Errorf("repository creation POST request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -393,7 +438,7 @@ func createRepoOnTarget(baseURL string, repoDef map[string]interface{}, user, pa
 		return fmt.Errorf("failed to create repository: status %d, body: %s", resp.StatusCode, string(body))
 	}
 
-	log.Printf("Repository '%s' successfully created on target.\n", repoDef["name"])
+	log.Printf("Repository '%s' successfully created on target.\n", repoName)
 	return nil
 }
 
